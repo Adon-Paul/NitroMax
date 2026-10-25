@@ -170,6 +170,19 @@ comprehensive_cleanup() {
   # Remove nitro key configuration
   rm -rf /etc/damx
 
+  # Remove DKMS module if registered
+  if command -v dkms &> /dev/null; then
+    echo "Removing DKMS module acer-nitro..."
+    dkms remove -m acer-nitro -v 1.0.0 --all 2>/dev/null || true
+  fi
+  rm -rf /usr/src/acer-nitro-1.0.0
+  rm -f /usr/local/bin/dkms-sign-module.sh
+
+  # Remove modprobe blacklist and udev rules
+  rm -f /etc/modprobe.d/acer-nitro.conf
+  rm -f /etc/udev/rules.d/99-acer-nitro.rules
+  udevadm control --reload-rules 2>/dev/null || true
+
   # Final systemd daemon reload
   systemctl daemon-reload
 
@@ -418,19 +431,128 @@ sign_driver_module() {
 install_build_deps() {
   if command -v pacman &> /dev/null; then
     # Arch-based (including CachyOS, Manjaro, EndeavourOS)
-    pacman -S --needed --noconfirm base-devel
+    pacman -S --needed --noconfirm base-devel dkms
     if is_llvm_kernel; then
       pacman -S --needed --noconfirm clang llvm lld
     fi
   elif command -v apt-get &> /dev/null; then
-    apt-get update && apt-get install -y build-essential
+    apt-get update && apt-get install -y build-essential dkms
   elif command -v dnf &> /dev/null; then
-    dnf install -y gcc make kernel-devel
+    dnf install -y gcc make kernel-devel dkms
   elif command -v zypper &> /dev/null; then
-    zypper install -y gcc make kernel-devel
+    zypper install -y gcc make kernel-devel dkms
   else
     echo -e "${RED}Error: Could not detect a supported package manager.${NC}"
     return 1
+  fi
+}
+
+install_dkms_driver() {
+  local dkms_dir="/usr/src/acer-nitro-1.0.0"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local dkms_conf=""
+  local dkms_sign=""
+
+  for candidate in "${script_dir}/dkms.conf" "${script_dir}/scripts/dkms.conf" "scripts/dkms.conf" "dkms.conf"; do
+    if [ -f "$candidate" ]; then
+      dkms_conf="$candidate"
+      break
+    fi
+  done
+
+  for candidate in "${script_dir}/dkms-sign-module.sh" "${script_dir}/scripts/dkms-sign-module.sh" "scripts/dkms-sign-module.sh" "dkms-sign-module.sh"; do
+    if [ -f "$candidate" ]; then
+      dkms_sign="$candidate"
+      break
+    fi
+  done
+
+  if [ -z "$dkms_conf" ] || [ ! -f "$dkms_conf" ]; then
+    echo -e "${YELLOW}Warning: dkms.conf not found. Falling back to direct compilation.${NC}"
+    return 1
+  fi
+
+  echo -e "${YELLOW}Registering driver with DKMS for automatic kernel update support...${NC}"
+
+  # Clean up existing registration
+  dkms remove -m acer-nitro -v 1.0.0 --all 2>/dev/null || true
+  rm -rf "$dkms_dir"
+  mkdir -p "$dkms_dir"
+
+  # Copy driver source files from current Linuwu-Sense directory
+  cp -r ./* "$dkms_dir/"
+  cp -f "$dkms_conf" "$dkms_dir/dkms.conf"
+
+  if [ -n "$dkms_sign" ] && [ -f "$dkms_sign" ]; then
+    cp -f "$dkms_sign" "$dkms_dir/dkms-sign-module.sh"
+    chmod +x "$dkms_dir/dkms-sign-module.sh"
+    # Also install to /usr/local/bin so PATH lookup in POST_BUILD succeeds unconditionally
+    cp -f "$dkms_sign" "/usr/local/bin/dkms-sign-module.sh"
+    chmod +x "/usr/local/bin/dkms-sign-module.sh"
+  fi
+
+  # Add, build, and install through DKMS
+  echo -e "${BLUE}Running dkms add, build, and install...${NC}"
+  if dkms add -m acer-nitro -v 1.0.0 && \
+     dkms build -m acer-nitro -v 1.0.0 && \
+     dkms install -m acer-nitro -v 1.0.0 --force; then
+    echo -e "${GREEN}Driver successfully built and installed via DKMS!${NC}"
+    return 0
+  else
+    echo -e "${YELLOW}DKMS build/install failed. Falling back to direct compilation...${NC}"
+    return 1
+  fi
+}
+
+install_hardware_configs() {
+  echo -e "${YELLOW}Installing modprobe configuration and udev rules...${NC}"
+
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  local modprobe_src=""
+  local udev_src=""
+
+  for candidate in "${script_dir}/acer-nitro.modprobe.conf" "${script_dir}/scripts/acer-nitro.modprobe.conf" "scripts/acer-nitro.modprobe.conf" "acer-nitro.modprobe.conf"; do
+    if [ -f "$candidate" ]; then
+      modprobe_src="$candidate"
+      break
+    fi
+  done
+
+  for candidate in "${script_dir}/99-acer-nitro.rules" "${script_dir}/scripts/99-acer-nitro.rules" "scripts/99-acer-nitro.rules" "99-acer-nitro.rules"; do
+    if [ -f "$candidate" ]; then
+      udev_src="$candidate"
+      break
+    fi
+  done
+
+  if [ -n "$modprobe_src" ]; then
+    mkdir -p /etc/modprobe.d
+    cp -f "$modprobe_src" /etc/modprobe.d/acer-nitro.conf
+    echo -e "${GREEN}Installed /etc/modprobe.d/acer-nitro.conf${NC}"
+  else
+    echo -e "${YELLOW}Warning: acer-nitro.modprobe.conf not found, creating default...${NC}"
+    mkdir -p /etc/modprobe.d
+    echo "blacklist acer_wmi" > /etc/modprobe.d/acer-nitro.conf
+  fi
+
+  if [ -n "$udev_src" ]; then
+    mkdir -p /etc/udev/rules.d
+    cp -f "$udev_src" /etc/udev/rules.d/99-acer-nitro.rules
+    echo -e "${GREEN}Installed /etc/udev/rules.d/99-acer-nitro.rules${NC}"
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+  else
+    echo -e "${YELLOW}Warning: 99-acer-nitro.rules not found, creating default...${NC}"
+    mkdir -p /etc/udev/rules.d
+    cat > /etc/udev/rules.d/99-acer-nitro.rules << 'EOL'
+ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="acer-wmi", TAG+="systemd", ENV{SYSTEMD_WANTS}+="damx-daemon.service"
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="*0CF2:5130*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="damx-daemon.service"
+EOL
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
   fi
 }
 
@@ -464,6 +586,15 @@ install_drivers() {
     if [ $signing_status -ne 0 ]; then
       cd .. || return 1
       return $signing_status
+    fi
+  fi
+
+  # Attempt DKMS driver installation if dkms is available
+  if command -v dkms &> /dev/null; then
+    if install_dkms_driver; then
+      echo -e "${GREEN}Linuwu-Sense drivers installed successfully via DKMS!${NC}"
+      cd .. || return 1
+      return 0
     fi
   fi
 
@@ -822,6 +953,9 @@ perform_install() {
 
   #Setup NitroButton shortcut
   configure_nitro_button
+
+  # Install modprobe blacklist and udev rules
+  install_hardware_configs
 
   # Check if all installations were successful
   if [ $DRIVER_RESULT -eq 0 ] && [ $DAEMON_RESULT -eq 0 ] && [ $GUI_RESULT -eq 0 ]; then

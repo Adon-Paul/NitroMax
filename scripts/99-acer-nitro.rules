@@ -1,0 +1,2 @@
+ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="acer-wmi", TAG+="systemd", ENV{SYSTEMD_WANTS}+="damx-daemon.service"
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="*0CF2:5130*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="damx-daemon.service"
