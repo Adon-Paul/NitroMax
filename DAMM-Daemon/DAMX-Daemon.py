@@ -18,6 +18,9 @@ import threading
 import signal
 import configparser
 import traceback
+import grp
+import struct
+import atexit
 from pathlib import Path
 from enum import Enum
 from PowerSourceDetection import PowerSourceDetector 
@@ -90,46 +93,19 @@ class LaptopType(Enum):
 class DAMXManager:
     """Manages all the DAMX-Daemon features"""
 
-    MAX_RESTART_ATTEMPTS = 20
-    RESTART_COUNTER_FILE = "/tmp/damx_restart_attempts"
+    SENSE_CANDIDATE_PATHS = [
+        "/sys/bus/platform/drivers/acer-wmi/acer-wmi/nitro_sense",
+        "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/nitro_sense",
+        "/sys/bus/platform/drivers/acer-wmi/acer-wmi/predator_sense",
+        "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense",
+    ]
 
     def __init__(self):
         '''The initial init (i know very nice description)'''
         log.info(f"** Starting DAMX-Daemon v{VERSION} **")
 
-        # Check if linuwu_sense is installed
-        if not os.path.exists("/sys/module/linuwu_sense"):
-            log.error("linuwu_sense module not found. Please install the linuwu_sense driver first.")
-        else:
-            log.info("linuwu_sense module found. Proceeding with initialization.")
-        
+        self.sense_path = ""
         self.laptop_type = self._detect_laptop_type()
-        # self.keyboard_monitor = None
-
-        #added a delay so that driver sets up properly first
-        time.sleep(0.2)
-
-        # If unknown laptop type detected, try restarting drivers (with limit)
-        if self.laptop_type == LaptopType.UNKNOWN:
-            current_attempts = self._get_restart_attempts()
-            
-            if current_attempts < self.MAX_RESTART_ATTEMPTS:
-                attempts = self._increment_restart_attempts()
-                log.warning(f"Unknown laptop type detected, attempting driver restart (attempt {attempts}/{self.MAX_RESTART_ATTEMPTS})...")
-                
-                if self._restart_drivers_and_daemon():
-                    # The daemon will restart itself, so we should exit this instance
-                    log.info("Driver restart initiated, daemon will restart automatically")
-                    sys.exit(0)
-                else:
-                    log.error(f"Failed to restart drivers (attempt {attempts}), continuing with limited functionality")
-            else:
-                log.error(f"Maximum restart attempts ({self.MAX_RESTART_ATTEMPTS}) reached, giving up on driver restart")
-                log.info("Continuing with unknown laptop type and limited functionality")
-        else:
-            # Reset counter on successful detection
-            self._reset_restart_attempts()
-        
         self.base_path = self._get_base_path()
         self.has_four_zone_kb = self._check_four_zone_kb()
         self.enek5130_hid_device = self._find_enek5130_hid_device()
@@ -150,34 +126,6 @@ class DAMXManager:
             raise FileNotFoundError(f"Base path does not exist: {self.base_path}")
         
         self.power_monitor = None
-
-    def _get_restart_attempts(self) -> int:
-        """Get current restart attempt count"""
-        try:
-            if os.path.exists(self.RESTART_COUNTER_FILE):
-                with open(self.RESTART_COUNTER_FILE, 'r') as f:
-                    return int(f.read().strip())
-        except (ValueError, IOError):
-            pass
-        return 0
-
-    def _increment_restart_attempts(self) -> int:
-        """Increment and return restart attempt count"""
-        attempts = self._get_restart_attempts() + 1
-        try:
-            with open(self.RESTART_COUNTER_FILE, 'w') as f:
-                f.write(str(attempts))
-        except IOError as e:
-            log.error(f"Failed to write restart counter: {e}")
-        return attempts
-
-    def _reset_restart_attempts(self):
-        """Reset restart attempt counter"""
-        try:
-            if os.path.exists(self.RESTART_COUNTER_FILE):
-                os.unlink(self.RESTART_COUNTER_FILE)
-        except IOError as e:
-            log.error(f"Failed to reset restart counter: {e}")
 
     def _force_model_nitro(self):
         """Restart linuwu-sense driver and DAMX daemon service with nitro_v4 parameter"""
@@ -396,7 +344,6 @@ class DAMXManager:
         
     def _restart_daemon(self):
         """Restart DAMX daemon service alone"""
-        attempts = self._get_restart_attempts()
         log.info(f"Attempting to restart daemon")
         
         try:
@@ -407,14 +354,13 @@ class DAMXManager:
             return True
             
         except Exception as e:
-            log.error(f"Unexpected error during restart (attempt {attempts}): {e}")
+            log.error(f"Unexpected error during restart: {e}")
             return False
             
 
     def _restart_drivers_and_daemon(self):
         """Restart linuwu-sense driver and DAMX daemon service"""
-        attempts = self._get_restart_attempts()
-        log.info(f"Attempting to restart drivers and daemon (attempt {attempts}/{self.MAX_RESTART_ATTEMPTS})...")
+        log.info("Attempting to restart drivers and daemon...")
         
         try:
             # Remove the module
@@ -438,29 +384,62 @@ class DAMXManager:
             return True
             
         except Exception as e:
-            log.error(f"Unexpected error during restart (attempt {attempts}): {e}")
+            log.error(f"Unexpected error during restart: {e}")
             return False
             
-    def _detect_laptop_type(self) -> LaptopType:
-        """Detect whether this is a Predator or Nitro laptop"""
-        predator_path = "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense"
-        nitro_path = "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/nitro_sense"
+    def _find_sense_path(self) -> str:
+        """Search sysfs sense paths in priority order."""
+        for path in self.SENSE_CANDIDATE_PATHS:
+            if os.path.isdir(path):
+                return path
+        return ""
 
-        if os.path.exists(predator_path):
-            return LaptopType.PREDATOR
-        elif os.path.exists(nitro_path):
+    def _detect_laptop_type(self) -> LaptopType:
+        """Detect whether this is a Nitro laptop and resolve sysfs sense directory"""
+        # 1. Immediate check
+        path = self._find_sense_path()
+        if path:
+            self.sense_path = path
+            self.base_path = path
+            log.info(f"Discovered Nitro sense directory: {path}")
             return LaptopType.NITRO
-        else:
-            return LaptopType.UNKNOWN
+
+        # 2. If module not loaded at boot, run modprobe linuwu_sense once
+        if not os.path.exists("/sys/module/linuwu_sense"):
+            log.info("linuwu_sense module not found, loading module via modprobe...")
+            try:
+                subprocess.run(['modprobe', 'linuwu_sense'], check=False)
+            except Exception as e:
+                log.error(f"Error loading linuwu_sense module: {e}")
+
+        # Check again after modprobe
+        path = self._find_sense_path()
+        if path:
+            self.sense_path = path
+            self.base_path = path
+            log.info(f"Discovered Nitro sense directory after modprobe: {path}")
+            return LaptopType.NITRO
+
+        # 3. Clean retry loop with backoff delays (0.1, 0.2, 0.5, 1.0, 2.0 seconds)
+        delays = [0.1, 0.2, 0.5, 1.0, 2.0]
+        log.info("Polling for sysfs sense directory to become ready...")
+        for delay in delays:
+            time.sleep(delay)
+            path = self._find_sense_path()
+            if path:
+                self.sense_path = path
+                self.base_path = path
+                log.info(f"Discovered Nitro sense directory after {delay}s backoff: {path}")
+                return LaptopType.NITRO
+
+        log.warning("No Nitro sysfs sense directory found after polling")
+        self.sense_path = ""
+        self.base_path = ""
+        return LaptopType.UNKNOWN
 
     def _get_base_path(self) -> str:
-        """Get the base path for VFS access based on laptop type"""
-        if self.laptop_type == LaptopType.PREDATOR:
-            return "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense"
-        elif self.laptop_type == LaptopType.NITRO:
-            return "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/nitro_sense"
-        else:
-            return ""
+        """Get the base path for VFS access based on detected sense path"""
+        return getattr(self, "sense_path", "") or getattr(self, "base_path", "") or ""
 
     def get_driver_version(self) -> str:
         """Get Driver version"""
@@ -1024,6 +1003,36 @@ class DaemonServer:
         self.running = False
         self.clients = []
 
+    def _secure_socket_permissions(self, socket_path: str):
+        """Harden socket permissions (0o660) and chown to administrative group if present"""
+        target_group = None
+        target_gid = None
+
+        for grp_name in ["damx", "wheel", "sudo", "adm"]:
+            try:
+                g = grp.getgrnam(grp_name)
+                target_group = grp_name
+                target_gid = g.gr_gid
+                break
+            except KeyError:
+                continue
+
+        if target_gid is not None:
+            try:
+                os.chown(socket_path, 0, target_gid)
+                os.chmod(socket_path, 0o660)
+                log.info(f"Secured socket {socket_path} with group {target_group} (GID {target_gid}) and mode 0o660")
+                return
+            except OSError as e:
+                log.warning(f"Could not chown socket to 0:{target_gid}: {e}")
+
+        # Fallback if no matching group was found
+        try:
+            os.chmod(socket_path, 0o660)
+            log.info(f"Set socket {socket_path} permissions to 0o660")
+        except OSError as e:
+            log.error(f"Failed to set permissions on {socket_path}: {e}")
+
     def start(self):
         """Start the Unix socket server"""
         # Remove socket if it already exists
@@ -1037,8 +1046,8 @@ class DaemonServer:
         try:
             self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.socket.bind(SOCKET_PATH)
-            # Ensure socket permissions allow non-root access
-            os.chmod(SOCKET_PATH, 0o666)
+            # Ensure socket permissions allow non-root access securely
+            self._secure_socket_permissions(SOCKET_PATH)
             self.socket.listen(5)
             self.socket.settimeout(1)  # 1 second timeout for clean shutdown
             self.running = True
@@ -1049,6 +1058,22 @@ class DaemonServer:
             while self.running:
                 try:
                     client, _ = self.socket.accept()
+
+                    # Verify client credentials via SO_PEERCRED
+                    try:
+                        ucred_size = struct.calcsize('3i')
+                        cred = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, ucred_size)
+                        pid, uid, gid = struct.unpack('3i', cred)
+                        if not (uid == 0 or uid >= 1000):
+                            log.warning(f"Rejecting client connection from unauthorized UID {uid} (PID {pid}, GID {gid})")
+                            try:
+                                client.close()
+                            except Exception:
+                                pass
+                            continue
+                    except Exception as e:
+                        log.warning(f"Could not verify client SO_PEERCRED: {e}")
+
                     client_thread = threading.Thread(target=self.handle_client, args=(client,))
                     client_thread.daemon = True
                     client_thread.start()
@@ -1097,41 +1122,45 @@ class DaemonServer:
         except Exception as e:
             log.error(f"Failed to remove socket file: {e}")
 
-
     def handle_client(self, client_socket):
-        """Handle communication with a client"""
+        """Handle communication with a client with chunk-reading loop until complete JSON can be parsed"""
+        buffer = ""
+        decoder = json.JSONDecoder()
         try:
             while self.running:
-                # Receive data from client
-                data = client_socket.recv(4096)
-                if not data:
+                # If buffer already contains a parseable JSON object, process it
+                buffer_stripped = buffer.lstrip()
+                if buffer_stripped:
+                    try:
+                        request, end_idx = decoder.raw_decode(buffer_stripped)
+                        consumed = (len(buffer) - len(buffer_stripped)) + end_idx
+                        buffer = buffer[consumed:]
+                        self._process_and_respond(client_socket, request)
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+
+                # Read next chunk from client
+                chunk = client_socket.recv(4096)
+                if not chunk:
                     break
 
-                try:
-                    # Parse JSON request
-                    request = json.loads(data.decode('utf-8'))
-                    command = request.get("command", "")
-                    params = request.get("params", {})
+                buffer += chunk.decode('utf-8', errors='replace')
 
-                    # Process command
-                    response = self.process_command(command, params)
-
-                    # Send response
-                    client_socket.sendall(json.dumps(response).encode('utf-8'))
-
-                except json.JSONDecodeError:
-                    log.error("Invalid JSON received")
-                    client_socket.sendall(json.dumps({
-                        "success": False,
-                        "error": "Invalid JSON format"
-                    }).encode('utf-8'))
-                except Exception as e:
-                    log.error(f"Error processing request: {e}")
-                    log.error(traceback.format_exc())
-                    client_socket.sendall(json.dumps({
-                        "success": False,
-                        "error": str(e)
-                    }).encode('utf-8'))
+                # Process any complete JSON objects now in buffer
+                while buffer:
+                    buffer_stripped = buffer.lstrip()
+                    if not buffer_stripped:
+                        buffer = ""
+                        break
+                    try:
+                        request, end_idx = decoder.raw_decode(buffer_stripped)
+                        consumed = (len(buffer) - len(buffer_stripped)) + end_idx
+                        buffer = buffer[consumed:]
+                        self._process_and_respond(client_socket, request)
+                    except json.JSONDecodeError:
+                        # Incomplete JSON, wait for more chunks
+                        break
 
         except Exception as e:
             if self.running:  # Only log if not shutting down
@@ -1140,6 +1169,31 @@ class DaemonServer:
             try:
                 client_socket.close()
             except:
+                pass
+
+    def _process_and_respond(self, client_socket, request):
+        """Process a parsed JSON request object and send response using sendall"""
+        try:
+            if not isinstance(request, dict):
+                response = {
+                    "success": False,
+                    "error": "Request must be a JSON object"
+                }
+            else:
+                command = request.get("command", "")
+                params = request.get("params", {})
+                response = self.process_command(command, params)
+
+            client_socket.sendall(json.dumps(response).encode('utf-8'))
+        except Exception as e:
+            log.error(f"Error processing request: {e}")
+            log.error(traceback.format_exc())
+            try:
+                client_socket.sendall(json.dumps({
+                    "success": False,
+                    "error": str(e)
+                }).encode('utf-8'))
+            except Exception:
                 pass
 
     def process_command(self, command: str, params: Dict) -> Dict:
@@ -1610,9 +1664,10 @@ class DAMXDaemon:
         with open(PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 
-        # Set up signal handlers
+        # Set up signal handlers and exit hooks
         signal.signal(signal.SIGTERM, self.signal_handler)
         signal.signal(signal.SIGINT, self.signal_handler)
+        atexit.register(self.cleanup)
 
         # if self.keyboard_monitor:
         #     success = self.keyboard_monitor.start_monitoring()
@@ -1636,8 +1691,19 @@ class DAMXDaemon:
             self.cleanup()
 
     def cleanup(self):
-        """Clean up resources"""
+        """Clean up resources and restore hardware auto-fan mode"""
         log.info("Cleaning up resources...")
+
+        # RULE 4: Always restore hardware auto fan mode (0,0) on daemon exit
+        if hasattr(self, 'manager') and self.manager and hasattr(self.manager, 'base_path') and self.manager.base_path:
+            try:
+                fan_path = os.path.join(self.manager.base_path, "fan_speed")
+                if os.path.exists(fan_path):
+                    with open(fan_path, 'w') as f:
+                        f.write("0,0")
+                    log.info("Restored hardware auto fan mode (0,0)")
+            except Exception as e:
+                log.warning(f"Could not restore auto fan mode: {e}")
     
         # Stop server and clean up socket
         if self.server:
@@ -1666,6 +1732,8 @@ class DAMXDaemon:
         self.running = False
         if self.server:
             self.server.running = False
+            self.server.cleanup_socket()
+        self.cleanup()
 
 def parse_args():
     """Parse command line arguments"""
@@ -1675,16 +1743,6 @@ def parse_args():
     parser.add_argument('--debug', action='store_true', help="Enable debug mode")
     parser.add_argument('--config', type=str, help=f"Path to config file (default: {CONFIG_PATH})")
     return parser.parse_args()
-
-def signal_handler(self, sig, frame):
-    """Handle termination signals"""
-    log.info(f"Received signal {sig}, shutting down...")
-    self.running = False
-    if self.server:
-        self.server.running = False
-    # Ensure socket is cleaned up
-    if hasattr(self, 'server') and self.server:
-        self.server.cleanup_socket()
 
 def main():
     """Main function"""
